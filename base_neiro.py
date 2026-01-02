@@ -1,3 +1,4 @@
+from mpi4py import MPI
 import time
 import glob
 import torch
@@ -10,7 +11,16 @@ from torchmetrics.segmentation import DiceScore
 import numpy as np
 from tqdm import tqdm
 from torchmetrics.segmentation import GeneralizedDiceScore
+torch.manual_seed(42)
+np.random.seed(42)
 
+comm = MPI.COMM_WORLD
+mpi_rank = comm.Get_rank()
+mpi_size = comm.Get_size()
+torch.set_num_threads(1)
+from torch.utils.data import Subset
+
+print(f"rank: {mpi_rank}, size: {mpi_size}")
 device = torch.device("cpu") 
 metrics_dict = torchmetrics.MetricCollection({
     'dice1': DiceScore(num_classes=16, average='micro', input_format='mixed', include_background=False),
@@ -65,10 +75,10 @@ class AMOSDataset(Dataset):
 
         vol_img = torch.tensor(vol_img)
         
-        vol_img = vol_img[60:380, 60:380, 5:85]  # D,H,W
+        vol_img = vol_img[:64, :64, :64]  # D,H,W
 
         vol_lbl = torch.tensor(vol_lbl)
-        vol_lbl = vol_lbl[60:380, 60:380, 5:85]  # D,H,W
+        vol_lbl = vol_lbl[:64, :64, :64]  # D,H,W
 
 
         x = vol_img.unsqueeze(0)  # (1, D, H, W)
@@ -195,16 +205,24 @@ class UNet3D(nn.Module):
 
 
 def train(filtered_imgs, filtered_lbls, val_imgs, val_lbls):
+    
+
     n = 20
     device = torch.device("cpu")
     
-    dataset = AMOSDataset(folder_img=filtered_imgs,folder_labels=filtered_lbls,max_items=180)
-    train_loader = DataLoader(dataset, batch_size=1, shuffle=True)
+    dataset = AMOSDataset(folder_img=filtered_imgs,folder_labels=filtered_lbls,max_items=50)
+    index = list(range(len(dataset)))                   #
+    rank_index = index[mpi_rank::mpi_size]              #       
+    local_dataset = Subset(dataset, rank_index)         #
+    train_loader = DataLoader(local_dataset, batch_size=1, shuffle=True)
+    print(f"index: {index[:5]}, rank index: {rank_index[:5]}, local dataset: {len(local_dataset)}\n")
 
     val_dataset = AMOSDataset(folder_img=val_imgs,folder_labels=val_lbls,max_items=20)
     val_loader = DataLoader(val_dataset, batch_size=1)
     
     model = UNet3D().to(device)
+    for p in model.parameters():
+        comm.Bcast(p.data.numpy(), root = 0)
     print(f"parametrs: {sum(p.numel() for p in model.parameters())}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -232,7 +250,13 @@ def train(filtered_imgs, filtered_lbls, val_imgs, val_lbls):
             loss = 0.5 * loss_ce + 0.5 * loss_dice
             
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            for p in model.parameters():                                        #
+                if p.grad is not None:                                          #     
+                    grad = p.grad.data.numpy()                                  #
+                    comm.Allreduce(MPI.IN_PLACE, grad, op=MPI.SUM)              #
+                    grad /= mpi_size                                            #
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)    
             optimizer.step()
             
             
@@ -247,19 +271,19 @@ def train(filtered_imgs, filtered_lbls, val_imgs, val_lbls):
 
         train_metrics = metrics_dict.compute()
         metrics_dict.reset()
-        
-        print(f"\n[TRAIN] Loss: {train_loss/len(train_loader):.8f} "
-              f"(CELoss: {train_ce/len(train_loader):.8f}, DiceLoss: {train_dice/len(train_loader):.8f})")
-        #print(f"Dice: {train_metrics['dice'].item():.8f}")
-        dice_class = train_metrics['dice']
-        for i, d in enumerate(dice_class, start=1):
-            print(f"Class {i}: Dice = {d.item():.4f}")
-        print(f"Dice base: {train_metrics['dice1'].item():.8f}")
-        print(f"Dice macro: {train_metrics['dice_macro'].item():.8f}")
-        print(f"IoU:  {train_metrics['iou'].item():.8f}")
-        print(f"Precision: {train_metrics['precision'].item():.8f}")
-        print(f"Recall:  {train_metrics['recall'].item():.8f}")
-        print(f"Time: {time.time() - start}")
+        if mpi_rank == 0:
+            print(f"\n[TRAIN] Loss: {train_loss/len(train_loader):.8f} "
+                f"(CELoss: {train_ce/len(train_loader):.8f}, DiceLoss: {train_dice/len(train_loader):.8f})")
+            #print(f"Dice: {train_metrics['dice'].item():.8f}")
+            dice_class = train_metrics['dice']
+            for i, d in enumerate(dice_class, start=1):
+                print(f"Class {i}: Dice = {d.item():.4f}")
+            print(f"Dice base: {train_metrics['dice1'].item():.8f}")
+            print(f"Dice macro: {train_metrics['dice_macro'].item():.8f}")
+            print(f"IoU:  {train_metrics['iou'].item():.8f}")
+            print(f"Precision: {train_metrics['precision'].item():.8f}")
+            print(f"Recall:  {train_metrics['recall'].item():.8f}")
+            print(f"Time: {time.time() - start}")
 
         #Val
         model.eval()
@@ -276,19 +300,36 @@ def train(filtered_imgs, filtered_lbls, val_imgs, val_lbls):
                 metrics_dict.update(F.softmax(pred, dim=1), y)
 
         val_metrics = metrics_dict.compute()
+        dice_local = val_metrics['dice'].mean().item()
+        dice_global = comm.allreduce(dice_local, op=MPI.SUM) / mpi_size
+
         metrics_dict.reset()
-        print(f"\n[VAL] Loss: {val_loss/len(val_loader):.4f}")
-        #print(f"Dice: {val_metrics['dice'].item():.6f}")
-        dice_class_val = val_metrics['dice']
-        for i, d in enumerate(dice_class_val, start=1):
-            print(f"Class {i}: Dice = {d.item():.6f}")
-        print(f"Dice base: {val_metrics['dice1'].item():.6f}")
-        print(f"Dice macro: {train_metrics['dice_macro'].item():.8f}")
-        print(f"IoU:  {val_metrics['iou'].item():.6f}")
-        print(f"Prec: {val_metrics['precision'].item():.6f}")
-        print(f"Rec:  {val_metrics['recall'].item():.6f}")
         
-        scheduler.step(val_metrics['dice'].mean().item())
+        if mpi_rank == 0:
+            print(f"\n[VAL] Loss: {val_loss/len(val_loader):.4f}")
+            #print(f"Dice: {val_metrics['dice'].item():.6f}")
+            dice_class_val = val_metrics['dice']
+            for i, d in enumerate(dice_class_val, start=1):
+                print(f"Class {i}: Dice = {d.item():.6f}")
+            print(f"Dice base: {val_metrics['dice1'].item():.6f}")
+            print(f"Dice macro: {train_metrics['dice_macro'].item():.8f}")
+            print(f"IoU:  {val_metrics['iou'].item():.6f}")
+            print(f"Prec: {val_metrics['precision'].item():.6f}")
+            print(f"Rec:  {val_metrics['recall'].item():.6f}")
+            print(f"Dice allreduce: {dice_global:.6f}")
+
+        
+        if mpi_rank == 0:
+            scheduler.step(val_metrics['dice'].mean().item())
+            lr = optimizer.param_groups[0]["lr"]
+        else:
+            lr = None
+        lr = comm.bcast(lr, root = 0)
+        for dict in optimizer.param_groups:
+            dict["lr"] = lr
+
+        comm.Barrier()
+
 
 
 
